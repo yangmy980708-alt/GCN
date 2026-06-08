@@ -1,0 +1,375 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import pdb
+from scipy import sparse
+import torch
+import time
+import os
+import sys
+sys.path.insert(0, '../source')
+from FEM_ForwardModel import analyticalstokes_f1, analyticalstokes_f2
+
+################################################################################
+
+
+def eval_unassembled_resjac_claw_cg_f(U, transf_data, elem,
+                                      elem_data, ldof2gdof_var, parsfuncI, parsfuncB):
+    """Evaluate elementwise residual and jacobian of conservation law in CG"""
+    nelem = elem_data.nelem
+    neqn_per_elem = elem.Tv_eqn_ref.shape[0]
+    nvar_per_elem = elem.Tv_var_ref.shape[0]
+    Re = np.zeros([neqn_per_elem, nelem])
+    dRe = np.zeros([neqn_per_elem, nvar_per_elem, nelem])
+    Re = Double(Re)
+    dRe = Double(dRe)
+    Re_ = []
+    dRe_ = []
+    for e in range(nelem):
+        Ue = U[ldof2gdof_var[:, e]]
+        Re0_, dRe0_ = intg_elem_claw_vol_f(Ue, transf_data, elem, elem_data, e, parsfuncI)
+        Re1_, dRe1_ = intg_elem_claw_extface(Ue, transf_data, elem, elem_data, e, parsfuncB)
+        Re_.append(ReshapeFix((Re0_ + Re1_), [neqn_per_elem, 1], order='F'))
+        dRe_.append(ReshapeFix((dRe0_ + dRe1_), [neqn_per_elem, nvar_per_elem, 1], order='C'))
+    Re = torch.cat(Re_, axis=1)
+    dRe = torch.cat(dRe_, axis=2)
+    return Re, dRe
+
+
+def create_fem_resjac_f(fespc, Uf, transf_data, elem, elem_data,
+                        ldof2gdof_eqn, ldof2gdof_var, e2e, spmat, dbc, enforce_idx=None, parsfuncI=None,
+                        parsfuncB=None):
+    """Create global residual(loss) and jacobian of conservation law in CG"""
+    ndof_var = np.max(ldof2gdof_var[:]) + 1
+    dbc_idx = dbc.dbc_idx
+    dbc_val = dbc.dbc_val
+    free_idx = dbc.free_idx
+    # Uf is the GCNN output
+    Uf = ReshapeFix(Uf, [ndof_var, 1], 'C')
+    U_temp = torch.zeros([ndof_var, 1]).double().to('cuda')
+    U_temp[dbc_idx, 0:] = torch.from_numpy(dbc_val).to('cuda').double().reshape(len(dbc_val), 1) \
+                          - Uf[dbc_idx, 0:]
+    U = U_temp + Uf
+    # U is the GCNN output hardimpose BC but can backPP
+    if fespc == 'cg' or fespc == 'CG':
+        Re, dRe = eval_unassembled_resjac_claw_cg_f(U, transf_data, elem, elem_data,
+                                                    ldof2gdof_var, parsfuncI, parsfuncB)
+        dR = assemble_nobc_mat(dRe, spmat.cooidx, spmat.lmat2gmat)
+    else:
+        raise ValueError('FE space only support cg!')
+    R = assemble_nobc_vec(Re, ldof2gdof_eqn)  # 组装残差
+    if enforce_idx == None:
+        Rf = R[free_idx]
+    else:
+        Rf = R[enforce_idx]
+    dRf = dR.tocsr()[free_idx, :]
+    dRf = dRf.tocsr()[:, free_idx].T
+    print('Max Rf ===============================', torch.max(torch.abs(Rf)))
+    return Rf, dRf, dbc
+
+
+
+
+
+def intg_elem_claw_vol_f(Ue, transf_data, elem, elem_data, e, parsfuncI=None):
+    """Intergrate elementwise internal volume of element residual and jacobian of conservation law"""
+    [neqn_per_elem, neqn, ndimP1, nq] = elem.Tv_eqn_ref.shape
+    [nvar_per_elem, nvar, _, _] = elem.Tv_var_ref.shape
+    ndim = ndimP1 - 1
+    wq = elem.wq
+    detG = transf_data.detG[:, e]
+    Tvar = elem_data.Tv_var_phys[:, :, :, :, e].reshape([nvar_per_elem, nvar * (ndim + 1) * nq],
+                                                        order='F')
+    Re = np.zeros([neqn_per_elem, 1])
+    dRe = np.zeros([neqn_per_elem, nvar_per_elem])
+    Tvar_tensor = torch.from_numpy(Tvar).double().to('cuda')
+    UQq = ReshapeFix(torch.mm(Tvar_tensor.T, Ue), [nvar, ndim + 1, nq], 'F')
+    w = wq * detG
+    Re = Double(Re)
+    dRe = Double(dRe)
+    for k in range(nq):
+        Teqn = elem_data.Tv_eqn_phys[:, :, :, k, e].reshape([neqn_per_elem, neqn * (ndim + 1)],
+                                                            order='F')
+        Tvar = elem_data.Tv_var_phys[:, :, :, k, e].reshape([nvar_per_elem, nvar * (ndim + 1)],
+                                                            order='F')
+        x = transf_data.xq[:, k, e]
+        f = function_of_the_right_f(x)
+        if parsfuncI == None:
+            pars = elem_data.vol_pars[:, k, e]
+        else:
+            pars = parsfuncI(x)
+        SF, dSFdU = elem.eqn.srcflux(UQq[:, :, k], f, pars, x)
+        dSFdU = ReshapeFix(dSFdU, [neqn * (ndim + 1), nvar * (ndim + 1)], order='F')  # [9,9]
+        Teqn = Double(Teqn)
+        Tvar = Double(Tvar)
+        # SF=SF.flatten()
+        SF = ReshapeFix(SF, [len(SF.flatten()), 1])
+        Re = Re - w[k] * ReshapeFix(torch.mm(Teqn, SF), Re.shape, order='F')
+        dRe = dRe - w[k] * torch.mm(Teqn, torch.mm(dSFdU, Tvar.T))
+    return Re, dRe
+
+def function_of_the_right_f(xq):
+	nu = 1
+	#xq=xq.reshape(-1,1)
+	f1 = [Double(analyticalstokes_f1(xq.reshape(-1, 1), nu).flatten().reshape(1, -1))]
+	f2 = [Double(analyticalstokes_f2(xq.reshape(-1, 1), nu).flatten().reshape(1, -1))]
+	# print("f1=",f1)
+	# print("f2",f2)
+	f1_ = torch.Tensor(f1)
+	f2_ = torch.Tensor(f2)
+	f_=torch.cat([f1_,f2_],axis=0)
+	return f_
+
+
+def intg_elem_claw_extface(Ue, transf_data, elem, elem_data, e, parsfuncB=None):
+    """Intergrate elementwise the boundary face of element residual and jacobian of conservation law """
+    [neqn_per_elem, neqn, ndimP1, nqf, nf] = elem.Tvf_eqn_ref.shape
+    [nvar_per_elem, nvar, _, _, _] = elem.Tvf_var_ref.shape
+    ndim = ndimP1 - 1
+    wqf = elem.wqf
+    sigf = transf_data.sigf[:, :, e]
+    nbcnbr = elem_data.nbcnbr[:, e]
+    Re = np.zeros([neqn_per_elem, 1])
+    dRe = np.zeros([neqn_per_elem, nvar_per_elem])
+    wf = wqf[:].reshape(len(wqf), 1) * sigf
+    Re = Double(Re)
+    dRe = Double(dRe)
+    for f in range(nf):
+        if np.isnan(nbcnbr[f]):# 判断是否为空值
+            continue
+        Tvar = np.reshape(elem_data.Tvf_var_phys[:, :, :, :, f, e],
+                          [nvar_per_elem, nvar * (ndim + 1) * nqf], order='F')
+        Tvar = Double(Tvar)
+        UQqf = ReshapeFix(torch.mm(Tvar.T, Ue), [nvar, ndim + 1, nqf], order='F')
+        for k in range(nqf):
+            x = transf_data.xqf[:, k, f, e]
+            n = transf_data.n[:, k, f, e]
+            Teqn = elem_data.Tvf_eqn_phys[:, :, 0, k, f, e]
+            Tvar = np.reshape(elem_data.Tvf_var_phys[:, :, :, k, f, e],
+                              [nvar_per_elem, nvar * (ndim + 1)], order='F')
+            Teqn = Double(Teqn)
+            Tvar = Double(Tvar)
+            if parsfuncB == None:
+                pars = elem_data.bnd_pars[:, k, f, e]
+            else:
+                pars = parsfuncB(x)
+            _, _, Fb, dFbdU = elem.eqn.bndstvcflux(nbcnbr[f], UQqf[:, :, k], pars, x, n)
+            dFbdU = ReshapeFix(dFbdU, [neqn, nvar * (ndim + 1)], order='F')
+            Re = Re + wf[k, f] * torch.mm(Teqn, Fb)
+            dRe = dRe + wf[k, f] * torch.mm(Teqn, torch.mm(dFbdU, Tvar.T))
+    return Re, dRe
+
+
+def assemble_nobc_mat(Me, cooidx, lmat2gmat):  # assemble_nobc_mat(dRe,spmat.cooidx,spmat.lmat2gmat)
+    """Assembly global jacobian of conservation law (currently no use)"""
+    Me = Me.detach().cpu().numpy()
+    nnz = cooidx.shape[0]
+    cooidx = cooidx.astype('int')
+    Mval = np.zeros(nnz)
+    nelem = Me.shape[2]
+    for e in range(nelem):
+        idx = lmat2gmat[:, :, e]
+        Mval[idx] = Mval[idx] + Me[:, :, e]
+    M = sparse.coo_matrix((Mval, (cooidx[:, 0], cooidx[:, 1])))
+    return M
+
+
+def assemble_nobc_vec(Fe, ldof2gdof_eqn):
+    """Assembly global residual of conservation law (!!very useful!!)"""
+    ndof = np.max(ldof2gdof_eqn[:]) + 1
+    nelem = Fe.shape[1]
+    F = np.zeros(ndof)
+    F = Double(F)
+    for e in range(nelem):
+        idx = ldof2gdof_eqn[:, e]
+        F[idx] = F[idx] + Fe[:, e]
+    return F
+
+
+
+def solve_fem_GCNN(msh,DataLoader,LossF,model,tol=1e-3,maxit=2000,qoiidx=None,softidx=None,penaltyConstant=None):
+	"""Wrapper"""
+	startime=time.time()
+	model,info,erlist_u,erlist_p=solve_SGD(msh,DataLoader,LossF,model,tol,maxit,qoiidx,softidx,penaltyConstant)
+	print('wallclock time of all epochs = ',time.time()-startime)
+	return model, info,erlist_u,erlist_p
+
+
+
+def solve_SGD(msh,DataLoader,LossF,model,tol,maxit,qoiidx,softidx,penaltyConstant,plotFlag='True'):
+	"""
+	DataLoader: training data
+	fcn: loss function
+	model: GCNN model to be trained
+	tol: the trauncation of loss function
+	maxit: the maximum number of epoch
+	"""
+	optimizer=torch.optim.Adam(model.parameters(), lr=0.001)
+	criterion=torch.nn.MSELoss()#均方误差，是预测值与真实值之差的平方和的平均值
+	Er=[];	Loss=[];Erlist_u=[];er_2=[];er_inf=[]
+	tol_e=[1,0.1,0.09,0.08,0.07,0.06,0.05,0.04,0.03,0.02,0.01,
+	       0.005,0.001,0.0009,0.0008,0.0007,
+		   0.0006,0.0005,0.0004,0.0003,0.0002,
+		   0.0001,0.00001]
+	idx_tol_e=0
+	for epoch in range(maxit):
+		print('epoch = ',epoch)
+		startime=time.time()
+		er,loss,model,erlist_u,erlist_p=trainmodel(msh,DataLoader,LossF,model,
+		           				 optimizer,criterion,qoiidx,softidx,penaltyConstant)
+		print('Solution er = ',er)
+		print('wallclock time of this epoch= ',time.time()-startime)
+		Er.append(er);Loss.append(loss);Erlist_u.append(erlist_u)
+		if loss<tol or er<tol_e[idx_tol_e]:
+			idx_tol_e=idx_tol_e+1
+			print('The training reaches the expected loss!')
+			torch.save(model,'./Er_'+str(er)+'Epoch_'+str(epoch)+'.pth')
+			np.savetxt('./Er_'+str(er)+'Epoch_'+str(epoch)+'.txt',np.asarray(Er))
+			np.savetxt('./Loss_'+str(loss)+'Epoch_'+str(epoch)+'.txt',np.asarray(Loss))
+			pass
+	torch.save(model,'./Er_'+str(er)+'Epoch_'+str(epoch)+'.pth')
+	np.savetxt('./Er_'+str(er)+'Epoch_'+str(epoch)+'.txt',np.asarray(Er))
+	np.savetxt('./Loss_'+str(loss)+'Epoch_'+str(epoch)+'.txt',np.asarray(Loss))
+	if plotFlag:
+		fig=plt.figure()
+		ax=plt.subplot(1,1,1)
+		ax.plot(Er,label='Relative Error')#相对误差
+		ax.plot(Loss,label='|Residual|')#损失
+		ax.legend()
+		ax.set_xlabel('Epoch')
+		ax.set_yscale('log')
+		fig.savefig('./LossResidual.png',bbox_inches='tight')#绘制折线图
+		plt.show()
+
+	# if plotFlag:
+	# 	fig=plt.figure()
+	# 	ax1=plt.subplot(1,1,1)
+	# 	ax1.plot(Erlist, label='Error')
+	# 	ax1.legend()
+	# 	ax1.set_xlabel('Epoch')
+	# 	ax1.set_yscale('log')
+	# 	fig.savefig('./error.png', bbox_inches='tight')  # 绘制折线图
+	# 	plt.show()
+
+	return model,{"Er":np.asarray(Er),"Loss":np.asarray(Loss)},erlist_u,erlist_p
+
+def trainmodel(msh,DataLoader,LossF,model,optimizer,criterion,qoiidx,softidx,penaltyConstant):
+	model.train()
+	eru_0=0;erp_0=0;loss_0=0
+	nnode=msh.xcg.shape[1]
+	# ndim=2
+	erlist_u=[]
+	erlist_p = []
+	ReList=[]
+	optimizer.zero_grad()
+	for data in DataLoader:
+		input=data[0].to('cuda')
+		fcn_id=data[0].y[0,0]
+		truth=data[0].y[1:,0:]
+		fcn=LossF[int(fcn_id)]
+		assert (int(fcn_id)-fcn_id)**2<1e-12,\
+		'The loss function is selected right!'
+		tic=time.time()
+		output = model(input)
+		Re,dRe,dbc=fcn(output)
+		print('wallclock time of evl Res= ',time.time()-tic)
+		ReList.append(torch.abs(Re))
+		#loss=loss+torch.norm(Re)#criterion(output,truth)#torch.max(torch.abs(Re)) #
+		solution=ReshapeFix(torch.clone(output),[len(output.flatten()),1],'C')
+		# print("solution1",solution)
+
+		solution[dbc.dbc_idx]=Double(dbc.dbc_val.reshape([len(dbc.dbc_val),1]))
+		solution_u = solution[0:2 * nnode]
+		solution_p = solution[2 * nnode:]
+		# print("solution_u", solution_u)
+		# print("solution_p", solution_p)
+		truth_u=truth[0:2 * nnode]
+		truth_p=truth[2*nnode:]
+		eru_0 = eru_0 + torch.sqrt(criterion(solution_u, truth_u) / criterion(truth_u, truth_u * 0)).item()
+		# loss_0=loss_0+loss.item()
+		erlist_u.append(torch.sqrt(criterion(solution_u, truth_u) / criterion(truth_u, truth_u * 0)).item())
+
+		erp_0 = erp_0 + torch.sqrt(criterion(solution_p, truth_p) / criterion(truth_p, truth_p * 0)).item()
+		# loss_0=loss_0+loss.item()
+		erlist_p.append(torch.sqrt(criterion(solution_p, truth_p) / criterion(truth_p, truth_p * 0)).item())
+	loss=ReList[0]*0
+	for i in range(len(ReList)):
+		loss=loss+ReList[i]
+	print('max Res=',loss.abs().max().item())
+	#print(loss)
+	loss=torch.norm(loss)#loss.max()#
+	if softidx is not None and penaltyConstant is not None:
+		print('DataLoss = ',criterion(solution[softidx],truth[softidx])*penaltyConstant)
+		loss=criterion(solution[softidx],truth[softidx])*penaltyConstant + loss
+		#print(solution-truth)
+		#pdb.set_trace()
+	else:
+		pass
+	if qoiidx is not None:
+		QOI_ER=torch.sqrt(criterion(solution[qoiidx],truth[qoiidx])\
+							/criterion(truth[qoiidx],truth[qoiidx]*0)).item()
+		print('QOI Error=',QOI_ER)
+		os.system("touch QOIError.txt")
+		os.system("touch QOIValue.txt")
+		file1 = open("QOIError.txt","a")
+		file1.writelines(str(QOI_ER)+"\n")
+		file2 = open("QOIValue.txt","a")
+		file2.writelines(str(solution[qoiidx].detach().cpu().numpy().reshape([1,-1])[:])+"\n")
+		file1.close()
+		file2.close()
+	else:
+		pass
+	tic=time.time()
+	loss.backward()
+	print('wallclock time of this BP= ',time.time()-tic)
+	optimizer.step()
+	print('>>>>>>>max error u<<<<<<< ====================================', max(erlist_u))
+	print('>>>>>>>max error p<<<<<<< ====================================', max(erlist_p))
+	try:
+		print('>>>>>>>model source<<<<<<< =======================',model.source)
+		os.system("touch ModelSource.txt")
+		file3= open("ModelSource.txt","a")
+		object2write=model.source.detach().cpu().numpy().reshape([1,-1])
+		for ifer in range(2):
+			try:
+				file3.writelines(str(object2write[0,ifer])+"\n")
+			except:
+				pass
+		file3.close()
+	except:
+		pass
+	#print('mean error = ',er_0/len(DataLoader))
+	#print('mean loss = ',loss.norm().item()/len(DataLoader))
+	return eru_0/len(DataLoader),loss.norm().item()/len(DataLoader),model,erlist_u,erlist_p
+
+
+
+def Reshape(input, Shape,order='F'):
+	if order=='F':
+		return torch.reshape(input,[Shape[len(Shape)-1-i] \
+			                for i in range(len(Shape))]).permute([len(Shape)-1-i \
+							for i in range(len(Shape))])
+	elif order=='C':
+		return torch.reshape(input, Shape)
+	else:
+		raise ValueError('Reshape Only Support Fortran or C')
+
+
+def ReshapeFix(input, Shape,order='F'):
+	if order=='F':
+		return torch.reshape(input.T,[Shape[len(Shape)-1-i] \
+			                for i in range(len(Shape))]).permute([len(Shape)-1-i \
+							for i in range(len(Shape))])
+	elif order=='C':
+		return torch.reshape(input, Shape)
+	else:
+		raise ValueError('Reshape Only Support Fortran or C')
+
+
+def Double(A):
+	if len(A.shape)==0 or (len(A.shape)==1 and A.shape[0]==1):
+		return torch.tensor([A]).reshape([1,1]).double().to('cuda')
+	else:
+		return torch.from_numpy(A).double().to('cuda')
+
+def Flatten(A):
+	torch.tensor([1,2])

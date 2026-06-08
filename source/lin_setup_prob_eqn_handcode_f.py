@@ -1,0 +1,90 @@
+import torch
+from torch import tensor
+import numpy as np
+import pdb
+
+from TensorFEMCore import Double, ReshapeFix
+
+import sys
+sys.path.insert(0, '../pycamotk')
+from pycamotkpyCaMOtk.create_mesh_hcube import mesh_hcube
+
+sys.path.insert(0, '../source')
+import TensorFEMCore
+from TensorFEMCore import Double
+from FEM_ForwardModel import analyticalNS_f1,analyticalNS_f2
+
+
+"""
+####Linear Elasticity Equation
+"""
+
+class setup_linelast_base_handcode_f(object):
+	"""docstring for setup_linelast_base_handcode"""
+	def __init__(self,ndim,lam,mu,tb,bnd2nbc):
+		self.bnd2nbc=bnd2nbc
+		self.eqn=LinearElasticityBaseHandcode(ndim)
+		self.vol_pars_fcn=lambda x, el: np.vstack((lam(x,el),
+			                                      mu(x,el),
+			                                      np.zeros([ndim,1])+np.nan))
+		self.bnd_pars_fcn=lambda x,n,bnd,el,fc:np.vstack((lam(x, el),
+			                                              mu(x, el),
+			                                              tb(x, n, bnd, el, fc)))
+
+		
+
+class LinearElasticityBaseHandcode(object):
+	"""docstring for LinearElasticityBaseHandcode"""
+	def __init__(self,ndim):
+		self.neqn=ndim
+		self.nvar=ndim
+		self.bndstvcflux=\
+		lambda nbcnbr, UQ, pars, x, n:\
+		eval_linelast_base_handcode_bndstvc_intr_bndflux_pars(UQ, pars, x, n)
+		self.srcflux=lambda UQ,f,pars,x:\
+		eval_linelast_base_handcode_srcflux(UQ,f, pars, x)
+
+def eval_linelast_base_handcode_srcflux(UQ, f,pars, x):
+	#print("uq",UQ.shape)
+	q=UQ[:,1:]
+	ndim=q.shape[0]
+	# Define information regarding size of the system
+	neqn=ndim
+	ncomp=ndim
+
+	# Extract parameters
+	lam=pars[0]
+	mu=pars[1]
+	f_=torch.tensor(f).reshape(-1,1).double().to('cuda')
+	F=-lam*torch.trace(q)*(Double(np.eye(ndim)))-mu*(q+q.T)
+	try:
+		S=Double(f_.reshape([ndim,1],order='F'))
+	except:
+		S=f_.reshape([ndim,1])
+	#pdb.set_trace()
+	SF=torch.cat((S,F),axis=1)
+	#print('SF=',SF)
+	dSFdU=Double(np.zeros([neqn,ndim+1,ncomp,ndim+1]))
+	for i in range(ndim):
+		for j in range(ndim):
+			dSFdU[i,1+i,j,1+j]=dSFdU[i,1+i,j,1+j]-lam
+			dSFdU[i,1+j,i,1+j]=dSFdU[i,1+j,i,1+j]-mu
+			dSFdU[i,1+j,j,1+i]=dSFdU[i,1+j,j,1+i]-mu
+	return SF, dSFdU
+
+
+def eval_linelast_base_handcode_bndstvc_intr_bndflux_pars(UQ,pars,x,n):
+	nvar=UQ.shape[0]
+	ndim=UQ.shape[1]-1
+
+	Ub=UQ[:,0]
+	dUb=np.zeros([nvar,nvar,ndim+1])
+	dUb[:,:,0]=np.eye(nvar)
+	Fn=-pars[-ndim:]
+	dFn=np.zeros([nvar,nvar,ndim+1])
+	dUb=Double(dUb)
+	Fn=ReshapeFix(Double(Fn),[len(Fn),1],order='F')
+	dFn=Double(dFn)
+	#print('Fn=',Fn)
+	return Ub,dUb,Fn,dFn
+
